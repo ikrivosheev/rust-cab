@@ -1,4 +1,4 @@
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::marker::PhantomData;
 use std::slice;
 
@@ -24,6 +24,7 @@ pub struct FolderEntry<'a> {
     files: &'a [FileEntry],
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct _FolderEntry {
     first_data_block_offset: u32,
     num_data_blocks: u16,
@@ -44,15 +45,14 @@ struct DataBlockEntry {
 }
 
 /// A reader for reading decompressed data from a cabinet folder.
-pub(crate) struct FolderReader<'a, R> {
+pub(crate) struct FolderReader<'a, R: 'a> {
     reader: &'a Cabinet<dyn ReadSeek + 'a>,
     decompressor: FolderDecompressor,
     total_size: u64,
     data_blocks: Vec<DataBlockEntry>,
     current_block_index: usize,
-    current_block_data: Vec<u8>,
-    current_offset_within_block: usize,
-    current_offset_within_folder: u64,
+    current_block: Option<Cursor<Vec<u8>>>,
+    offset: u64,
     _p: PhantomData<R>,
 }
 
@@ -102,7 +102,7 @@ impl<'a> FolderEntry<'a> {
     }
 }
 
-impl<'a, R: Read + Seek> FolderReader<'a, R> {
+impl<'a, R: 'a + Read + Seek> FolderReader<'a, R> {
     pub(crate) fn new(
         reader: &'a Cabinet<dyn ReadSeek + 'a>,
         entry: &_FolderEntry,
@@ -154,12 +154,11 @@ impl<'a, R: Read + Seek> FolderReader<'a, R> {
             total_size,
             data_blocks,
             current_block_index: 0,
-            current_block_data: Vec::new(),
-            current_offset_within_block: 0,
-            current_offset_within_folder: 0,
+            current_block: None,
+            offset: 0,
             _p: PhantomData,
         };
-        folder_reader.load_block()?;
+        folder_reader.current_block = folder_reader.load_block()?;
         Ok(folder_reader)
     }
 
@@ -171,24 +170,13 @@ impl<'a, R: Read + Seek> FolderReader<'a, R> {
         }
     }
 
-    fn rewind(&mut self) -> io::Result<()> {
-        self.current_offset_within_block = 0;
-        self.current_offset_within_folder = 0;
-        if self.current_block_index != 0 {
-            self.current_block_index = 0;
-            self.load_block()?;
-        }
-        Ok(())
-    }
-
-    fn load_block(&mut self) -> io::Result<()> {
+    fn load_block(&mut self) -> io::Result<Option<Cursor<Vec<u8>>>> {
         if self.current_block_index >= self.data_blocks.len() {
-            self.current_block_data = Vec::new();
-            return Ok(());
+            return Ok(None);
         }
         let block = &self.data_blocks[self.current_block_index];
-        let reader = &mut &self.reader.inner;
 
+        let reader = &mut &self.reader.inner;
         reader.seek(SeekFrom::Start(block.data_offset))?;
         let mut compressed_data = vec![0u8; block.compressed_size as usize];
         reader.read_exact(&mut compressed_data)?;
@@ -209,7 +197,7 @@ impl<'a, R: Read + Seek> FolderReader<'a, R> {
                 );
             }
         }
-        self.current_block_data = match self.decompressor {
+        let current_block_data = match self.decompressor {
             FolderDecompressor::Uncompressed => compressed_data,
             FolderDecompressor::MsZip(ref mut decompressor) => decompressor
                 .decompress_block(&compressed_data, block.uncompressed_size)?,
@@ -218,31 +206,32 @@ impl<'a, R: Read + Seek> FolderReader<'a, R> {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
                 .to_vec(),
         };
-        Ok(())
+
+        Ok(Some(Cursor::new(current_block_data)))
     }
 }
 
 impl<'a, R: Read + Seek + 'a> Read for FolderReader<'a, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() || self.current_block_index >= self.data_blocks.len()
-        {
+        if buf.is_empty() {
             return Ok(0);
         }
-        if self.current_offset_within_block == self.current_block_data.len() {
-            self.current_block_index += 1;
-            self.current_offset_within_block = 0;
-            self.load_block()?;
+
+        loop {
+            match &mut self.current_block {
+                Some(b) => {
+                    let size = b.read(buf)?;
+                    if size == 0 {
+                        self.current_block_index += 1;
+                        self.current_block = self.load_block()?;
+                        continue;
+                    }
+                    self.offset += size as u64;
+                    break Ok(size);
+                }
+                None => break Ok(0),
+            }
         }
-        let max_bytes = buf.len().min(
-            self.current_block_data.len() - self.current_offset_within_block,
-        );
-        buf[..max_bytes].copy_from_slice(
-            &self.current_block_data[self.current_offset_within_block..]
-                [..max_bytes],
-        );
-        self.current_offset_within_block += max_bytes;
-        self.current_offset_within_folder += max_bytes as u64;
-        Ok(max_bytes)
     }
 }
 
@@ -250,9 +239,7 @@ impl<'a, R: Read + Seek> Seek for FolderReader<'a, R> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let new_offset = match pos {
             SeekFrom::Start(offset) => offset as i64,
-            SeekFrom::Current(delta) => {
-                self.current_offset_within_folder as i64 + delta
-            }
+            SeekFrom::Current(delta) => self.offset as i64 + delta,
             SeekFrom::End(delta) => self.total_size as i64 + delta,
         };
         if new_offset < 0 || (new_offset as u64) > self.total_size {
@@ -273,14 +260,31 @@ impl<'a, R: Read + Seek> Seek for FolderReader<'a, R> {
                 < new_offset
             {
                 self.current_block_index += 1;
-                self.load_block()?;
+                match self.load_block()? {
+                    Some(b) => self.current_block = Some(b),
+                    None => break,
+                };
             }
         }
-        debug_assert!(new_offset >= self.current_block_start());
-        self.current_offset_within_block =
-            (new_offset - self.current_block_start()) as usize;
-        self.current_offset_within_folder = new_offset;
-        Ok(new_offset)
+
+        let offset = new_offset - self.current_block_start();
+        match &mut self.current_block {
+            Some(b) => {
+                b.seek(SeekFrom::Start(offset))?;
+                self.offset = new_offset;
+                Ok(new_offset)
+            }
+            None => Ok(0),
+        }
+    }
+
+    fn rewind(&mut self) -> io::Result<()> {
+        self.offset = 0;
+        if self.current_block_index != 0 {
+            self.current_block_index = 0;
+            self.current_block = self.load_block()?;
+        }
+        Ok(())
     }
 }
 

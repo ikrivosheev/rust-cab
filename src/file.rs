@@ -103,7 +103,6 @@ impl FileEntry {
 
 impl<'a, R: Read + Seek> Read for FileReader<'a, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        debug_assert!(self.offset <= self.size);
         let bytes_remaining = self.size - self.offset;
         let max_bytes = bytes_remaining.min(buf.len() as u64) as usize;
         if max_bytes == 0 {
